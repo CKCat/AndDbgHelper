@@ -1,4 +1,3 @@
-import logging
 import os
 import platform
 import subprocess
@@ -10,8 +9,9 @@ import ida_ida
 import ida_kernwin
 import idaapi
 import idc
+from loguru import logger
 
-logger = logging.getLogger("AndDbgHelper")
+# logger = logging.getLogger("AndDbgHelper")
 
 
 class JdbRunner:
@@ -64,7 +64,6 @@ class JdbRunner:
 class Device:
     """设备管理类"""
 
-    devices = {}
     device_serial = ""
     grep = "grep"
     if platform.system() == "Windows":
@@ -122,6 +121,10 @@ class Device:
                 )
 
                 if result.returncode == 0:
+                    logger.debug(
+                        "stdout: {}",
+                        result.stdout.decode("utf-8", errors="ignore").strip(),
+                    )
                     return result.stdout.decode(
                         "utf-8", errors="ignore"
                     ).strip()
@@ -169,19 +172,25 @@ class Device:
             "shell",
             f"su -c killall {android_server} ",
         ]
-        Device.run_adb_command(kill_cmd)
+        try:
+            Device.run_adb_command(kill_cmd)
+        except Exception as e:
+            logger.debug(f"[-] Kill android_server failed: {str(e)}")
 
         # 启动服务器
         run_android_server = f"{remote_path} -p {port} > /dev/null 2>&1 &"
         execute_cmd = [
             "adb",
-            "-t",
+            "-s",
             Device.device_serial,
             "shell",
             f"su -c {run_android_server}",
         ]
-        result = Device.run_adb_command(execute_cmd)
-        return bool(result)
+        try:
+            Device.run_adb_command(execute_cmd)
+        except Exception as e:
+            logger.debug(f"[-] Kill android_server failed: {str(e)}")
+        return True
 
     @staticmethod
     def start_and_wait_for_app(package_name: str, max_attempts: int = 3) -> int:
@@ -220,18 +229,6 @@ class Device:
         """连接 JDB"""
         jdb_runner = JdbRunner(jdb_debug_port)
         jdb_runner.start()
-
-        # 等待 JDB 启动
-        start_time = time.time()
-        while not jdb_runner.is_running:
-            if time.time() - start_time > timeout:
-                logger.error("JDB 启动超时")
-                jdb_runner.stop()
-                return False
-            time.sleep(0.5)
-
-        logger.info("JDB 已在后台成功启动")
-        return jdb_runner
 
     @staticmethod
     def set_application_to_debug_mode(package_name: str) -> bool:
@@ -317,6 +314,7 @@ class AndDbgHelper(idaapi.plugin_t):
         self.remote_port = 23946  # 默认端口
         self.jdb_debug_port = 8700
         self.devices = {}
+        self.is_init = False
 
         # 断点配置
         self.set_jni_onload_bpt = True
@@ -328,80 +326,53 @@ class AndDbgHelper(idaapi.plugin_t):
         self.adb_timeout = 10
         self.dump_chunk_size = 0x10000
 
-        # 日志配置
-        self._setup_logging()
-
-    def _setup_logging(self):
-        """设置日志配置"""
-        self.log_level = logging.DEBUG
-        logging.basicConfig(
-            level=self.log_level,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-
-    def _check_server_status(self) -> bool:
-        """检查 android_server 状态"""
-        return Device.check_server_status(self.android_server)
-
-    def _check_adb_available(self) -> bool:
-        """检查 ADB 是否可用"""
-        return Device.check_adb_available()
-
     def init(self):
         """初始化插件"""
-        try:
-            # 验证 IDA 路径
-            self.ida_path = idc.idadir()
-            if not os.path.exists(self.ida_path):
-                raise RuntimeError(f"Invalid IDA path: {self.ida_path}")
 
-            # 选择合适的 android_server
-            self.android_server = (
-                "android_server"
-                if not ida_ida.inf_is_32bit_exactly()
-                else "android_server32"
-            )
-            self.android_server_path = os.path.join(
-                self.ida_path, "dbgsrv", self.android_server
-            )
-            self.remote_path = os.path.join(
-                self.remote_path, self.android_server
-            )
-            if not os.path.exists(self.android_server_path):
-                raise RuntimeError(
-                    f"Android server not found: {self.android_server_path}"
-                )
-            logger.debug(f"[+] Using {self.android_server}")
-
-            # 验证 ADB 可用性
-            if not self._check_adb_available():
-                raise RuntimeError("ADB not available")
-            # 添加 dump 菜单
-            self.add_dump_menu()
-
-            logger.info(
-                f"[+] AndDbgHelper {self.version} Plugin initialized successfully"
-            )
-            return idaapi.PLUGIN_KEEP
-
-        except Exception as e:
-            logger.error(f"[-] Failed to initialize plugin: {str(e)}")
-            ida_kernwin.warning(f"Failed to initialize plugin: {str(e)}")
-            return idaapi.PLUGIN_SKIP
+        logger.info(
+            f"[+] AndDbgHelper {self.version} Plugin initialized successfully"
+        )
+        return idaapi.PLUGIN_KEEP
 
     def run(self, arg):
-        self.so_name = idaapi.get_root_filename()
-        # 获取设备列表
-        self.devices = Device.list_devices()
-        if not self.devices:
-            idaapi.msg("[-] No devices found. Exiting.")
-            return
-        logger.debug(f"[+] Found {self.devices} devices.")
-        self.show_input_dialog()
-        if not self.package_name:
-            logger.error("[-] Package name not specified. Exiting.")
-            return
-        self.start_debugging()
+        try:
+            if not self.is_init:
+                # 验证 IDA 路径
+                self.ida_path = idc.idadir()
+                # 选择合适的 android_server
+                self.android_server = (
+                    "android_server"
+                    if not ida_ida.inf_is_32bit_exactly()
+                    else "android_server32"
+                )
+                self.android_server_path = os.path.join(
+                    self.ida_path, "dbgsrv", self.android_server
+                )
+                self.remote_path = os.path.join(
+                    self.remote_path, self.android_server
+                )
+                if not os.path.exists(self.android_server_path):
+                    raise RuntimeError(
+                        f"Android server not found: {self.android_server_path}"
+                    )
+                logger.debug(f"[+] Using {self.android_server}")
+
+                self.so_name = idaapi.get_root_filename()
+                # 获取设备列表
+                self.devices = Device.list_devices()
+                if not self.devices:
+                    idaapi.msg("[-] No devices found. Exiting.")
+                    return
+                logger.debug(f"[+] Found {self.devices} devices.")
+                self.is_init = True
+
+            self.show_input_dialog()
+            if not self.package_name:
+                logger.error("[-] Package name not specified. Exiting.")
+                return
+            self.start_debugging()
+        except Exception as e:
+            logger.error(f"[-] Error: {str(e)}")
 
     def term(self):
         Device.remove_application_from_debug_mode()
@@ -492,11 +463,6 @@ class AndDbgHelper(idaapi.plugin_t):
         logger.debug("Starting Android debugging...")
 
         try:
-            # 检查端口是否被占用
-            if Device.is_port_in_use(self.remote_port):
-                logger.error(f"[-] Port {self.remote_port} is already in use")
-                return False
-
             # 拷贝并启动 Android 服务端
             Device.push_android_server(
                 self.android_server_path, self.remote_path
@@ -523,46 +489,34 @@ class AndDbgHelper(idaapi.plugin_t):
             Device.forward_jdwp(pid, self.jdb_debug_port)
 
             try:
+                # ida_dbg.set_debugger_options(
+                #     ida_dbg.DOPT_LIB_BPT | ida_dbg.DOPT_THREAD_BPT
+                # )
+
                 # 设置远程调试器
-                if not ida_dbg.set_remote_debugger(
+                ida_dbg.set_remote_debugger(
                     self.remote_host, str(self.remote_port)
-                ):
-                    logger.error("[-] Failed to set remote debugger")
-                    return False
+                )
 
                 # 附加到进程
-                if not ida_dbg.attach_process(pid, 1):
-                    logger.error(f"[-] Failed to attach to process {pid}")
-                    return False
+                ida_dbg.attach_process(pid, 1)
 
                 logger.debug(f"[+] Successfully attached debugger: PID={pid}")
 
                 # 继续执行进程
-                if not ida_dbg.continue_process():
-                    logger.error("[-] Failed to continue process")
-                    return False
-
+                ida_dbg.continue_process()
                 logger.debug(f"[+] Successfully running {self.package_name}")
 
                 # 等待调试器事件
-                if not ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1):
-                    logger.error("[-] Failed to wait for debug event")
-                    return False
+                ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, 1)
 
             except Exception as e:
                 logger.error(f"[-] Failed to attach debugger: {str(e)}")
                 return False
 
             # 连接 JDB
-            jdb_runner = Device.jdb_connect(self.jdb_debug_port)
-            if not jdb_runner:
-                logger.error("[-] Failed to start JDB")
-                return False
-
+            Device.jdb_connect(self.jdb_debug_port)
             logger.debug("[+] Successfully connected to JDB")
-
-            # 设置断点
-            self.find_and_set_breakpoints()
 
             return True
 
@@ -588,120 +542,7 @@ class AndDbgHelper(idaapi.plugin_t):
                 self.set_breakpoint(jni_onload_addr)
             else:
                 logger.debug("[-] JNI_OnLoad not found")
-
-        # 设置 .init_proc 断点
-        if self.set_init_proc_bpt:
-            init_proc_addr = idc.get_name_ea_simple(".init_proc")
-            if init_proc_addr != idc.BADADDR:
-                logger.debug(f"[+] Found .init_proc at 0x{init_proc_addr:08X}")
-                self.set_breakpoint(init_proc_addr)
-            else:
-                logger.debug("[-] .init_proc not found")
-
-        # 设置 init_array 断点
-        if self.set_init_array_bpt:
-            seg_init_array = idaapi.get_segm_by_name(".init_array")
-            if seg_init_array != idc.BADADDR:
-                logger.debug(
-                    f"[+] Found .init_array at 0x{seg_init_array.start_ea:08X}"
-                )
-                self.set_breakpoint(seg_init_array.start_ea)
-            else:
-                logger.debug("[-] .init_array segment not found")
-
-    def add_dump_menu(self):
-        """为模块列表添加右键菜单的 Dump 选项"""
-
-        class DumpSOAction(idaapi.action_handler_t):
-            def __init__(self, plugin):
-                idaapi.action_handler_t.__init__(self)
-                self.plugin = plugin
-
-            def activate(self, ctx):
-                ea = idaapi.get_screen_ea()
-                module_base = ida_dbg.get_first_module()
-                module_name = ida_dbg.get_module_name(module_base)
-                if module_name:
-                    self.plugin.dump_module(module_name, module_base)
-                return 1
-
-            def update(self, ctx):
-                return idaapi.AST_ENABLE_FOR_WIDGET
-
-        action_desc = idaapi.action_desc_t(
-            "android_so_debugger:dump_so",
-            "Dump SO Memory",
-            DumpSOAction(self),
-            None,
-            "Dump selected SO memory to file",
-            199,
-        )
-        idaapi.register_action(action_desc)
-        idaapi.attach_action_to_popup(None, None, "android_so_debugger:dump_so")
-
-    def dump_module(
-        self, module_name: str, module_base: int, chunk_size: int = None
-    ) -> bool:
-        """Dump 所选 SO 的内存到文件
-
-        Args:
-            module_name: 模块名称
-            module_base: 模块基地址
-            chunk_size: 每次读取的大小(字节)
-
-        Returns:
-            bool: 操作是否成功
-        """
-        if not module_name or not module_base:
-            logger.error("Invalid module parameters")
-            return False
-
-        chunk_size = chunk_size or self.dump_chunk_size
-
-        try:
-            module_size = ida_dbg.get_module_size(module_base)
-            if not module_size:
-                logger.error(f"Failed to get size for {module_name}")
-                return False
-
-            dump_path = os.path.join(self.remote_path, f"{module_name}_dump.so")
-            total_chunks = (module_size + chunk_size - 1) // chunk_size
-            last_progress = -1
-
-            with open(dump_path, "wb") as f:
-                for chunk_index in range(total_chunks):
-                    if ida_kernwin.user_cancelled():
-                        logger.info("Dump cancelled by user")
-                        return False
-
-                    start = module_base + chunk_index * chunk_size
-                    end = min(start + chunk_size, module_base + module_size)
-
-                    # 只在进度变化时更新显示
-                    progress = (chunk_index + 1) * 100 // total_chunks
-                    if progress != last_progress:
-                        ida_kernwin.replace_wait_box(
-                            f"Dumping {module_name}... {progress}%"
-                        )
-                        last_progress = progress
-
-                    # 读取内存
-                    chunk_data = ida_dbg.read_memory(start, end - start)
-                    if not chunk_data:
-                        logger.error(f"Failed to read memory at 0x{start:x}")
-                        continue
-
-                    f.write(chunk_data)
-
-            ida_kernwin.hide_wait_box()
-            logger.info(f"Successfully dumped module to {dump_path}")
-            return True
-
-        except Exception as e:
-            ida_kernwin.hide_wait_box()
-            logger.error(f"Error dumping module: {str(e)}")
-            ida_kernwin.warning(f"Error dumping module: {str(e)}")
-            return False
+        # TODO set_init_proc_bpt 和 set_init_array_bpt
 
 
 # 注册插件
